@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       kernel_tag:
-        description: "ophub/kernel release tag (pilih sesuai uname -r: ophub=stable, beta=beta, flippy=flippy)"
+        description: "ophub/kernel release tag (match uname -r: ophub=stable, beta=beta, flippy=flippy)"
         required: true
         default: "kernel_stable"
         type: choice
@@ -30,7 +30,8 @@ jobs:
             git make bc bison flex \
             libssl-dev libelf-dev \
             xz-utils tar gzip curl \
-            gcc-aarch64-linux-gnu
+            gcc-aarch64-linux-gnu \
+            rsync
 
       - name: Download ophub kernel bundle
         run: |
@@ -43,29 +44,24 @@ jobs:
           mkdir -p kb
           tar -xzf kernel_bundle.tar.gz -C kb
           echo "== Bundle contents =="
-          find kb -maxdepth 3 -type f -print
+          find kb -maxdepth 4 -type f -print
 
       - name: Locate header & modules tarballs
         run: |
           set -eux
-
-          # Cari header tar
-          HDR_TAR="$(find kb -maxdepth 4 -type f \( -name '*header*.tar.gz' -o -name '*headers*.tar.gz' \) | head -n1 || true)"
-          # Cari modules tar
-          MOD_TAR="$(find kb -maxdepth 4 -type f -name '*modules*.tar.gz' | head -n1 || true)"
-
+          HDR_TAR="$(find kb -maxdepth 6 -type f \( -name '*header*.tar.gz' -o -name '*headers*.tar.gz' \) | head -n1 || true)"
+          MOD_TAR="$(find kb -maxdepth 6 -type f -name '*modules*.tar.gz' | head -n1 || true)"
           if [ -z "$HDR_TAR" ] || [ -z "$MOD_TAR" ]; then
             echo "Gagal nemu header/modules tar. Isi kb:"
-            find kb -maxdepth 4 -type f -print
+            find kb -maxdepth 6 -type f -print
             exit 2
           fi
-
           echo "HDR_TAR=$HDR_TAR" >> "$GITHUB_ENV"
           echo "MOD_TAR=$MOD_TAR" >> "$GITHUB_ENV"
           echo "Header tar: $HDR_TAR"
           echo "Modules tar: $MOD_TAR"
 
-      - name: Extract headers & detect KREL
+      - name: Extract headers & detect KREL + KSRC
         run: |
           set -eux
           rm -rf headers
@@ -75,19 +71,16 @@ jobs:
           echo "== Sample modules tar paths (first 60) =="
           tar -tf "$MOD_TAR" | head -n 60 || true
 
-          # 1) Coba format: lib/modules/<KREL>/...
+          # KREL: format A) lib/modules/<KREL>/...  atau  B) <KREL>/kernel/...
           KREL="$(tar -tf "$MOD_TAR" \
             | sed 's|^\./||' \
             | sed -n 's#^lib/modules/\([^/]\+\)/.*#\1#p' \
             | head -n1 || true)"
-
-          # 2) Kalau tidak ada lib/modules, ambil folder pertama: <KREL>/kernel/...
           if [ -z "$KREL" ]; then
             KREL="$(tar -tf "$MOD_TAR" \
               | sed 's|^\./||' \
               | awk -F/ 'NF>1{print $1; exit}' || true)"
           fi
-
           echo "Detected KREL=$KREL"
           if [ -z "$KREL" ]; then
             echo "Tidak bisa deteksi KREL dari modules tar"
@@ -95,20 +88,31 @@ jobs:
           fi
           echo "KREL=$KREL" >> "$GITHUB_ENV"
 
-          # Cari KSRC (linux headers dir)
-          KSRC="$(find headers -type d -name 'linux-headers-*' | head -n1 || true)"
-          if [ -z "$KSRC" ]; then
-            # fallback: cari dir yang ada Makefile kernel
-            KSRC="$(find headers -type f -name Makefile | grep -E 'linux-headers|usr/src' | head -n1 | xargs -r dirname || true)"
+          # KSRC: header tar ophub biasanya langsung tree kernel -> headers/Makefile ada
+          KSRC=""
+          if [ -f "headers/Makefile" ] && [ -f "headers/Kconfig" ]; then
+            KSRC="headers"
+          else
+            # fallback kalau ada linux-headers-* di dalamnya
+            KSRC="$(find headers -type d -name 'linux-headers-*' | head -n1 || true)"
           fi
+
           if [ -z "$KSRC" ] || [ ! -f "$KSRC/Makefile" ]; then
             echo "Gagal nemu KSRC yang valid. Dump candidates:"
-            find headers -maxdepth 6 -type f -name Makefile -print | head -n 80
+            find headers -maxdepth 6 -type f -name Makefile -print | head -n 120
             exit 2
           fi
+
           echo "KSRC=$KSRC" >> "$GITHUB_ENV"
           echo "Using KSRC=$KSRC"
           ls -lah "$KSRC" | head
+
+      - name: Prepare kernel headers (modules_prepare)
+        run: |
+          set -eux
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          make -C "${KSRC}" ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" modules_prepare
 
       - name: Build rtl8189fs (rtl8189ES_linux branch rtl8189fs)
         run: |
@@ -122,13 +126,8 @@ jobs:
           export CROSS_COMPILE=aarch64-linux-gnu-
           export KSRC="${KSRC}"
 
-          # Cara 1 (lebih standar): build sebagai external module via kernel headers
-          make -C "${KSRC}" M="$PWD" ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" modules -j"$(nproc)" || true
-
-          # Cara 2 (fallback): build pakai Makefile driver sendiri
-          if ! ls -1 *.ko >/dev/null 2>&1; then
-            make -j"$(nproc)"
-          fi
+          # Build sebagai external module (cara yang benar)
+          make -C "${KSRC}" M="$PWD" ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" modules -j"$(nproc)"
 
           echo "Built .ko:"
           ls -lah *.ko
