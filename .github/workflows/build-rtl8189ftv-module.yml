@@ -68,8 +68,8 @@ jobs:
           mkdir -p headers
           tar -xzf "$HDR_TAR" -C headers
 
-          echo "== Sample modules tar paths (first 60) =="
-          tar -tf "$MOD_TAR" | head -n 60 || true
+          echo "== Sample modules tar paths (first 40) =="
+          tar -tf "$MOD_TAR" | head -n 40 || true
 
           # KREL: format A) lib/modules/<KREL>/...  atau  B) <KREL>/kernel/...
           KREL="$(tar -tf "$MOD_TAR" \
@@ -88,30 +88,37 @@ jobs:
           fi
           echo "KREL=$KREL" >> "$GITHUB_ENV"
 
-          # KSRC: header tar ophub biasanya langsung tree kernel -> headers/Makefile ada
+          # KSRC: cari root kernel tree (yang penting: Makefile + arch + scripts)
           KSRC=""
-          if [ -f "headers/Makefile" ] && [ -f "headers/Kconfig" ]; then
-            KSRC="headers"
-          else
-            # fallback kalau ada linux-headers-* di dalamnya
-            KSRC="$(find headers -type d -name 'linux-headers-*' | head -n1 || true)"
-          fi
+          for d in headers headers/*; do
+            if [ -f "$d/Makefile" ] && [ -d "$d/arch" ] && [ -d "$d/scripts" ]; then
+              KSRC="$d"
+              break
+            fi
+          done
 
-          if [ -z "$KSRC" ] || [ ! -f "$KSRC/Makefile" ]; then
-            echo "Gagal nemu KSRC yang valid. Dump candidates:"
-            find headers -maxdepth 6 -type f -name Makefile -print | head -n 120
+          if [ -z "$KSRC" ]; then
+            echo "Gagal nemu KSRC (root kernel tree). Dump structure headers:"
+            find headers -maxdepth 3 -type f -name Makefile -print | head -n 120
             exit 2
           fi
 
           echo "KSRC=$KSRC" >> "$GITHUB_ENV"
           echo "Using KSRC=$KSRC"
-          ls -lah "$KSRC" | head
+          ls -lah "$KSRC" | head -n 50
+
+          echo "== Quick sanity =="
+          [ -f "$KSRC/Makefile" ] && echo "OK: Makefile"
+          [ -d "$KSRC/arch" ] && echo "OK: arch/"
+          [ -d "$KSRC/scripts" ] && echo "OK: scripts/"
+          (ls -lah "$KSRC/include" | head -n 10) || true
 
       - name: Prepare kernel headers (modules_prepare)
         run: |
           set -eux
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
+          # modules_prepare butuh file generated; header ophub biasanya sudah siap
           make -C "${KSRC}" ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" modules_prepare
 
       - name: Build rtl8189fs (rtl8189ES_linux branch rtl8189fs)
@@ -126,7 +133,6 @@ jobs:
           export CROSS_COMPILE=aarch64-linux-gnu-
           export KSRC="${KSRC}"
 
-          # Build sebagai external module (cara yang benar)
           make -C "${KSRC}" M="$PWD" ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" modules -j"$(nproc)"
 
           echo "Built .ko:"
