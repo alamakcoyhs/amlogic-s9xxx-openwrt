@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       kernel_tag:
-        description: "ophub/kernel release tag (kernel_beta / kernel_stable / kernel_flippy)"
+        description: "ophub/kernel release tag"
         required: true
         default: "kernel_beta"
         type: choice
@@ -20,12 +20,17 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-22.04
     steps:
       - name: Install deps
         run: |
+          set -eux
           sudo apt-get update -y
-          sudo apt-get install -y git make gcc bc bison flex libssl-dev libelf-dev xz-utils tar gzip
+          sudo apt-get install -y \
+            git make bc bison flex \
+            libssl-dev libelf-dev \
+            xz-utils tar gzip curl \
+            gcc-aarch64-linux-gnu
 
       - name: Download ophub kernel bundle
         run: |
@@ -34,81 +39,93 @@ jobs:
           BUNDLE="${{ inputs.kernel_bundle }}"
           URL="https://github.com/ophub/kernel/releases/download/${TAG}/${BUNDLE}"
           echo "Downloading: $URL"
-          curl -L --retry 3 -o kernel_bundle.tar.gz "$URL"
-          mkdir -p kb && tar -xzf kernel_bundle.tar.gz -C kb
-          ls -lah kb
+          curl -L --retry 3 --retry-delay 2 -o kernel_bundle.tar.gz "$URL"
+          mkdir -p kb
+          tar -xzf kernel_bundle.tar.gz -C kb
+          echo "== Bundle contents =="
+          find kb -maxdepth 2 -type f -print
 
-      - name: Locate header/modules packages
+      - name: Locate header & modules tarballs
         run: |
           set -eux
-          # Cari tar header & modules di dalam bundle
-          HDR_TAR="$(ls -1 kb/*header*.tar.gz 2>/dev/null | head -n1 || true)"
-          MOD_TAR="$(ls -1 kb/*modules*.tar.gz 2>/dev/null | head -n1 || true)"
 
-          # Kalau bundle berisi tar lain, cari rekursif
-          if [ -z "$HDR_TAR" ] || [ -z "$MOD_TAR" ]; then
-            HDR_TAR="$(find kb -maxdepth 2 -type f -name '*header*.tar.gz' | head -n1 || true)"
-            MOD_TAR="$(find kb -maxdepth 2 -type f -name '*modules*.tar.gz' | head -n1 || true)"
-          fi
-
-          echo "HDR_TAR=$HDR_TAR" >> $GITHUB_ENV
-          echo "MOD_TAR=$MOD_TAR" >> $GITHUB_ENV
+          # Cari header/modules tar. (ophub biasanya tar.gz)
+          HDR_TAR="$(find kb -maxdepth 3 -type f \( -name '*header*.tar.gz' -o -name '*headers*.tar.gz' \) | head -n1 || true)"
+          MOD_TAR="$(find kb -maxdepth 3 -type f \( -name '*modules*.tar.gz' \) | head -n1 || true)"
 
           if [ -z "$HDR_TAR" ] || [ -z "$MOD_TAR" ]; then
-            echo "Gagal nemu header/modules tar di bundle. Isi kb:"
+            echo "Gagal nemu header/modules tar. Isi kb:"
             find kb -maxdepth 3 -type f -print
             exit 2
           fi
 
+          echo "HDR_TAR=$HDR_TAR" >> "$GITHUB_ENV"
+          echo "MOD_TAR=$MOD_TAR" >> "$GITHUB_ENV"
           echo "Header tar: $HDR_TAR"
           echo "Modules tar: $MOD_TAR"
 
-      - name: Extract headers & get kernel release string
+      - name: Extract headers & detect KREL
         run: |
           set -eux
-          rm -rf headers modroot
-          mkdir -p headers modroot
-
+          rm -rf headers
+          mkdir -p headers
           tar -xzf "$HDR_TAR" -C headers
-          tar -xzf "$MOD_TAR" -C modroot
 
-          # ambil uname -r (KREL) dari isi modules tar
-          KREL="$(tar -tf "$MOD_TAR" | sed 's|^\./||' | awk -F/ '/^lib\/modules\/[^/]+\//{print $3; exit}')"
+          # Robust: ambil KREL dari path lib/modules/<KREL>/...
+          KREL="$(tar -tf "$MOD_TAR" \
+            | sed 's|^\./||' \
+            | sed -n 's#.*lib/modules/\([^/]\+\)/.*#\1#p' \
+            | head -n1)"
+
+          echo "KREL candidate: $KREL"
+          echo "Sample modules tar paths:"
+          tar -tf "$MOD_TAR" | head -n 40
+
           if [ -z "$KREL" ]; then
             echo "Tidak bisa deteksi KREL dari modules tar"
             exit 2
           fi
-          echo "KREL=$KREL" >> $GITHUB_ENV
+
+          echo "KREL=$KREL" >> "$GITHUB_ENV"
           echo "Detected KREL=$KREL"
 
-          # cari KSRC (linux headers dir)
-          KSRC="$(find headers -type f -name Makefile | grep -E 'linux-headers|usr/src' | head -n1 | xargs -r dirname || true)"
+          # Cari folder headers yang punya Makefile kernel
+          KSRC="$(find headers -type f -name Makefile \
+            | grep -E 'linux-headers|usr/src' \
+            | head -n1 \
+            | xargs -r dirname || true)"
+
           if [ -z "$KSRC" ]; then
             KSRC="$(find headers -type d -name 'linux-headers-*' | head -n1 || true)"
           fi
+
           if [ -z "$KSRC" ] || [ ! -f "$KSRC/Makefile" ]; then
-            echo "Gagal nemu KSRC yang valid. Dump headers:"
-            find headers -maxdepth 4 -type f -name Makefile -print
+            echo "Gagal nemu KSRC yang valid. Dump Makefile candidates:"
+            find headers -maxdepth 6 -type f -name Makefile -print | head -n 50
             exit 2
           fi
-          echo "KSRC=$KSRC" >> $GITHUB_ENV
-          echo "Using KSRC=$KSRC"
 
-      - name: Build rtl8189fs driver (jwrdegoede branch rtl8189fs)
+          echo "KSRC=$KSRC" >> "$GITHUB_ENV"
+          echo "Using KSRC=$KSRC"
+          ls -lah "$KSRC" | head
+
+      - name: Build rtl8189fs (rtl8189ES_linux branch rtl8189fs) as external module
         run: |
           set -eux
           git clone --depth 1 https://github.com/jwrdegoede/rtl8189ES_linux.git drv
           cd drv
-          # sesuai referensi RTL8189FTV: checkout branch rtl8189fs
           git fetch --depth 1 origin rtl8189fs
           git checkout -B rtl8189fs origin/rtl8189fs
 
           export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
           export KSRC="${KSRC}"
 
+          # Build sebagai external module (paling kompatibel)
+          make -C "${KSRC}" M="$PWD" ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" modules -j"$(nproc)" || \
           make -j"$(nproc)"
 
-          echo "Built ko:"
+          echo "Built .ko:"
           ls -lah *.ko
 
           mkdir -p "../pkg/lib/modules/${KREL}/kernel/drivers/net/wireless/realtek/rtl8189fs"
@@ -120,7 +137,7 @@ jobs:
           OUT="rtl8189ftv-module-${KREL}.tar.gz"
           tar -czf "$OUT" -C pkg .
           ls -lah "$OUT"
-          echo "OUTFILE=$OUT" >> $GITHUB_ENV
+          echo "OUTFILE=$OUT" >> "$GITHUB_ENV"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
