@@ -1,0 +1,129 @@
+name: Build RTL8189FTV/RTL8189FS WiFi module (HG680P)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_tag:
+        description: "ophub/kernel release tag (kernel_beta / kernel_stable / kernel_flippy)"
+        required: true
+        default: "kernel_beta"
+        type: choice
+        options:
+          - kernel_beta
+          - kernel_stable
+          - kernel_flippy
+      kernel_bundle:
+        description: "Kernel bundle filename on that tag (contoh: 6.12.74.tar.gz)"
+        required: true
+        default: "6.12.74.tar.gz"
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Install deps
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y git make gcc bc bison flex libssl-dev libelf-dev xz-utils tar gzip
+
+      - name: Download ophub kernel bundle
+        run: |
+          set -eux
+          TAG="${{ inputs.kernel_tag }}"
+          BUNDLE="${{ inputs.kernel_bundle }}"
+          URL="https://github.com/ophub/kernel/releases/download/${TAG}/${BUNDLE}"
+          echo "Downloading: $URL"
+          curl -L --retry 3 -o kernel_bundle.tar.gz "$URL"
+          mkdir -p kb && tar -xzf kernel_bundle.tar.gz -C kb
+          ls -lah kb
+
+      - name: Locate header/modules packages
+        run: |
+          set -eux
+          # Cari tar header & modules di dalam bundle
+          HDR_TAR="$(ls -1 kb/*header*.tar.gz 2>/dev/null | head -n1 || true)"
+          MOD_TAR="$(ls -1 kb/*modules*.tar.gz 2>/dev/null | head -n1 || true)"
+
+          # Kalau bundle berisi tar lain, cari rekursif
+          if [ -z "$HDR_TAR" ] || [ -z "$MOD_TAR" ]; then
+            HDR_TAR="$(find kb -maxdepth 2 -type f -name '*header*.tar.gz' | head -n1 || true)"
+            MOD_TAR="$(find kb -maxdepth 2 -type f -name '*modules*.tar.gz' | head -n1 || true)"
+          fi
+
+          echo "HDR_TAR=$HDR_TAR" >> $GITHUB_ENV
+          echo "MOD_TAR=$MOD_TAR" >> $GITHUB_ENV
+
+          if [ -z "$HDR_TAR" ] || [ -z "$MOD_TAR" ]; then
+            echo "Gagal nemu header/modules tar di bundle. Isi kb:"
+            find kb -maxdepth 3 -type f -print
+            exit 2
+          fi
+
+          echo "Header tar: $HDR_TAR"
+          echo "Modules tar: $MOD_TAR"
+
+      - name: Extract headers & get kernel release string
+        run: |
+          set -eux
+          rm -rf headers modroot
+          mkdir -p headers modroot
+
+          tar -xzf "$HDR_TAR" -C headers
+          tar -xzf "$MOD_TAR" -C modroot
+
+          # ambil uname -r (KREL) dari isi modules tar
+          KREL="$(tar -tf "$MOD_TAR" | sed 's|^\./||' | awk -F/ '/^lib\/modules\/[^/]+\//{print $3; exit}')"
+          if [ -z "$KREL" ]; then
+            echo "Tidak bisa deteksi KREL dari modules tar"
+            exit 2
+          fi
+          echo "KREL=$KREL" >> $GITHUB_ENV
+          echo "Detected KREL=$KREL"
+
+          # cari KSRC (linux headers dir)
+          KSRC="$(find headers -type f -name Makefile | grep -E 'linux-headers|usr/src' | head -n1 | xargs -r dirname || true)"
+          if [ -z "$KSRC" ]; then
+            KSRC="$(find headers -type d -name 'linux-headers-*' | head -n1 || true)"
+          fi
+          if [ -z "$KSRC" ] || [ ! -f "$KSRC/Makefile" ]; then
+            echo "Gagal nemu KSRC yang valid. Dump headers:"
+            find headers -maxdepth 4 -type f -name Makefile -print
+            exit 2
+          fi
+          echo "KSRC=$KSRC" >> $GITHUB_ENV
+          echo "Using KSRC=$KSRC"
+
+      - name: Build rtl8189fs driver (jwrdegoede branch rtl8189fs)
+        run: |
+          set -eux
+          git clone --depth 1 https://github.com/jwrdegoede/rtl8189ES_linux.git drv
+          cd drv
+          # sesuai referensi RTL8189FTV: checkout branch rtl8189fs
+          git fetch --depth 1 origin rtl8189fs
+          git checkout -B rtl8189fs origin/rtl8189fs
+
+          export ARCH=arm64
+          export KSRC="${KSRC}"
+
+          make -j"$(nproc)"
+
+          echo "Built ko:"
+          ls -lah *.ko
+
+          mkdir -p "../pkg/lib/modules/${KREL}/kernel/drivers/net/wireless/realtek/rtl8189fs"
+          cp -f *.ko "../pkg/lib/modules/${KREL}/kernel/drivers/net/wireless/realtek/rtl8189fs/"
+
+      - name: Pack module tarball
+        run: |
+          set -eux
+          OUT="rtl8189ftv-module-${KREL}.tar.gz"
+          tar -czf "$OUT" -C pkg .
+          ls -lah "$OUT"
+          echo "OUTFILE=$OUT" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rtl8189ftv-module
+          path: ${{ env.OUTFILE }}
